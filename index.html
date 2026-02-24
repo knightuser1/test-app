@@ -205,7 +205,7 @@ function Field({ label, unit, value, min, max, step, onChange }) {
     <label style={s.fieldWrap}>
       <span style={s.fieldLabel}>{label}</span>
       <div style={s.fieldRow}>
-        <input style={s.fieldInput} type="number" value={0} min={min} max={max} step={step} onChange={onChange} />
+        <input style={s.fieldInput} type="number" value={value} min={min} max={max} step={step} onChange={onChange} />
         <span style={s.fieldUnit}>{unit}</span>
       </div>
     </label>
@@ -261,27 +261,77 @@ function QuizScreen({ questions, cfg, onFinish }) {
   const [chosen, setChosen] = useState(null);
   const [confirm, setConfirm] = useState(false);
 
+  // Refs so callbacks always have fresh values without stale closures
+  const chosenRef = useRef(null);
+  const idxRef = useRef(0);
+  const answersRef = useRef({});
+
+  // Keep refs in sync with state
+  useEffect(() => { chosenRef.current = chosen; }, [chosen]);
+  useEffect(() => { idxRef.current = idx; }, [idx]);
+  useEffect(() => { answersRef.current = answers; }, [answers]);
+
   const q = questions[idx];
   const total = questions.length;
-  const answeredCount = Object.keys(answers).length;
 
-  useEffect(() => { setChosen(answers[q.id] ?? null); }, [idx]);
+  // When idx changes, restore saved answer for that question
+  useEffect(() => {
+    const saved = answersRef.current[questions[idx].id] ?? null;
+    setChosen(saved);
+    chosenRef.current = saved;
+  }, [idx]);
 
-  const commitCurrent = (prev) => {
-    const next = { ...prev };
-    if (chosen !== null) next[q.id] = chosen;
-    return next;
+  // Save current selection into answers, return updated map
+  const saveCurrentAndGet = () => {
+    const qid = questions[idxRef.current].id;
+    const updated = { ...answersRef.current };
+    if (chosenRef.current !== null) {
+      updated[qid] = chosenRef.current;
+    }
+    return updated;
   };
 
+  // Navigate to a new question index, committing current answer first
   const goTo = (newIdx) => {
-    setAnswers((prev) => commitCurrent(prev));
+    const updated = saveCurrentAndGet();
+    setAnswers(updated);
+    answersRef.current = updated;
     setIdx(newIdx);
   };
 
+  // Skip without saving
+  const skip = () => {
+    if (idx < total - 1) {
+      setIdx(idx + 1);
+    }
+  };
+
+  // Save & go to next
+  const saveAndNext = () => {
+    const updated = saveCurrentAndGet();
+    setAnswers(updated);
+    answersRef.current = updated;
+    setIdx(idx + 1);
+  };
+
+  // Final submission
   const doFinish = () => {
-    const final = commitCurrent({ ...answers });
+    const final = saveCurrentAndGet();
     onFinish(final);
   };
+
+  // Count answers including any pending unsaved selection
+  const answeredCount = (() => {
+    const pending = { ...answersRef.current };
+    if (chosenRef.current !== null) pending[q.id] = chosenRef.current;
+    return Object.keys(pending).length;
+  })();
+
+  // Also compute this for the modal display
+  const totalAnsweredIfSubmit = (() => {
+    const pending = saveCurrentAndGet();
+    return Object.keys(pending).length;
+  })();
 
   const statusOf = (i) => {
     if (i === idx) return "current";
@@ -324,14 +374,34 @@ function QuizScreen({ questions, cfg, onFinish }) {
             ))}
           </div>
           <div style={s.navRow}>
-            <button style={s.skipBtn} onClick={() => { if (idx < total - 1) { setIdx(idx + 1); setChosen(null); } }} disabled={idx === total - 1}>
+            <button
+              style={{ ...s.skipBtn, opacity: idx === total - 1 ? 0.4 : 1 }}
+              onClick={skip}
+              disabled={idx === total - 1}
+            >
               Skip →
             </button>
             <div style={{ display: "flex", gap: 10 }}>
-              <button style={{ ...s.prevBtn, opacity: idx === 0 ? 0.4 : 1 }} onClick={() => goTo(idx - 1)} disabled={idx === 0}>← Prev</button>
+              <button
+                style={{ ...s.prevBtn, opacity: idx === 0 ? 0.4 : 1 }}
+                onClick={() => goTo(idx - 1)}
+                disabled={idx === 0}
+              >
+                ← Prev
+              </button>
               {idx < total - 1
-                ? <button style={{ ...s.nextBtn, opacity: chosen === null ? 0.5 : 1 }} onClick={() => { setAnswers((p) => commitCurrent(p)); setIdx(idx + 1); setChosen(null); }}>Save & Next →</button>
-                : <button style={s.finishBtn} onClick={() => setConfirm(true)}>Finish Test ✓</button>
+                ? (
+                  <button
+                    style={{ ...s.nextBtn, opacity: chosen === null ? 0.5 : 1 }}
+                    onClick={saveAndNext}
+                  >
+                    Save & Next →
+                  </button>
+                ) : (
+                  <button style={s.finishBtn} onClick={() => setConfirm(true)}>
+                    Finish Test ✓
+                  </button>
+                )
               }
             </div>
           </div>
@@ -355,7 +425,14 @@ function QuizScreen({ questions, cfg, onFinish }) {
             {questions.map((_, i) => {
               const st = statusOf(i);
               return (
-                <button key={i} style={{ ...s.palBtn, ...(st === "current" ? s.palCurrent : st === "answered" ? s.palAnswered : {}) }} onClick={() => goTo(i)}>
+                <button
+                  key={i}
+                  style={{
+                    ...s.palBtn,
+                    ...(st === "current" ? s.palCurrent : st === "answered" ? s.palAnswered : {}),
+                  }}
+                  onClick={() => goTo(i)}
+                >
                   {questions[i].id}
                 </button>
               );
@@ -375,12 +452,19 @@ function QuizScreen({ questions, cfg, onFinish }) {
           <div style={s.modal} className="fu">
             <h3 style={s.modalTitle}>Submit Test?</h3>
             <p style={s.modalBody}>
-              You've answered <strong>{Object.keys(commitCurrent({ ...answers })).length}</strong> of <strong>{total}</strong> questions.
-              {total - Object.keys(commitCurrent({ ...answers })).length > 0 && ` ${total - Object.keys(commitCurrent({ ...answers })).length} will be marked skipped.`}
+              You've answered{" "}
+              <strong>{totalAnsweredIfSubmit}</strong> of{" "}
+              <strong>{total}</strong> questions.
+              {total - totalAnsweredIfSubmit > 0 &&
+                ` ${total - totalAnsweredIfSubmit} will be marked as skipped.`}
             </p>
             <div style={s.modalBtns}>
-              <button style={s.cancelBtn} onClick={() => setConfirm(false)}>Continue Test</button>
-              <button style={s.confirmBtn} onClick={doFinish}>Yes, Submit</button>
+              <button style={s.cancelBtn} onClick={() => setConfirm(false)}>
+                Continue Test
+              </button>
+              <button style={s.confirmBtn} onClick={doFinish}>
+                Yes, Submit
+              </button>
             </div>
           </div>
         </div>
