@@ -205,7 +205,7 @@ function Field({ label, unit, value, min, max, step, onChange }) {
     <label style={s.fieldWrap}>
       <span style={s.fieldLabel}>{label}</span>
       <div style={s.fieldRow}>
-        <input style={s.fieldInput} type="number" value={value} min={min} max={max} step={step} onChange={onChange} />
+        <input style={s.fieldInput} type="number" value={0} min={min} max={max} step={step} onChange={onChange} />
         <span style={s.fieldUnit}>{unit}</span>
       </div>
     </label>
