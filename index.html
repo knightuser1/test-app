@@ -1,0 +1,595 @@
+import { useState, useEffect, useRef } from "react";
+
+/* ─────────────────────────────────────────────
+   PDF PARSING
+───────────────────────────────────────────── */
+async function loadPDFJS() {
+  if (window.pdfjsLib) return;
+  await new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload = res;
+    s.onerror = rej;
+    document.head.appendChild(s);
+  });
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
+
+async function extractText(file) {
+  await loadPDFJS();
+  const buf = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+  let text = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const lineMap = {};
+    content.items.forEach((item) => {
+      const y = Math.round(item.transform[5]);
+      lineMap[y] = (lineMap[y] || "") + item.str + " ";
+    });
+    const lines = Object.keys(lineMap)
+      .sort((a, b) => b - a)
+      .map((k) => lineMap[k].trim());
+    text += lines.join("\n") + "\n";
+  }
+  return text;
+}
+
+function parseQuestions(raw) {
+  const text = raw.replace(/[ \t]+/g, " ").replace(/\n+/g, "\n").trim();
+  const blocks = text.split(/\n(?=(?:Q\.?\s*)?\d{1,3}[.)]\s)/i).filter(Boolean);
+  const questions = [];
+  for (const block of blocks) {
+    const numM = block.match(/^(?:Q\.?\s*)?(\d{1,3})[.)]\s+/i);
+    if (!numM) continue;
+    const num = parseInt(numM[1]);
+    const ansM = block.match(/\bAns(?:wer)?[.:\s]+\[?([A-Da-d])\]?/i);
+    const correct = ansM ? ansM[1].toUpperCase() : null;
+    const cleaned = block.replace(/\bAns(?:wer)?[.:\s]+\[?[A-Da-d]\]?/gi, "");
+    const optRegex = /(?:\n|^|\s)([A-Da-d])[.)]\s+([^\n([]+)/g;
+    const options = [];
+    let m;
+    while ((m = optRegex.exec(cleaned)) !== null) {
+      const letter = m[1].toUpperCase();
+      const txt = m[2].trim();
+      if (txt.length > 0 && !options.find((o) => o.letter === letter))
+        options.push({ letter, text: txt });
+    }
+    const firstOptStart = cleaned.search(/(?:\n|^|\s)[A-Da-d][.)]\s+/);
+    const questionText =
+      firstOptStart > 0
+        ? cleaned.substring(numM[0].length, firstOptStart).replace(/\n/g, " ").trim()
+        : cleaned.substring(numM[0].length, 300).replace(/\n/g, " ").trim();
+    if (questionText.length > 3 && options.length >= 2)
+      questions.push({ id: num, text: questionText, options, correct });
+  }
+  return questions.sort((a, b) => a.id - b.id);
+}
+
+/* ─────────────────────────────────────────────
+   DESIGN TOKENS
+───────────────────────────────────────────── */
+const C = {
+  bg: "#F5F0E8", paper: "#FEFCF7", ink: "#1A1612", inkLight: "#6B6560",
+  accent: "#D4401A", accentHover: "#B8341A", accentBg: "#FDF0EC",
+  gold: "#C9A84C", goldBg: "#FBF5E6",
+  green: "#2A7A4B", greenBg: "#E8F5EE",
+  border: "#DDD8CC", borderStrong: "#C5BFB3",
+  shadow: "rgba(26,22,18,0.08)", shadowMd: "rgba(26,22,18,0.14)",
+};
+
+const GlobalCSS = () => (
+  <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;600&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: ${C.bg}; font-family: 'Source Serif 4', Georgia, serif; color: ${C.ink}; }
+    button { font-family: inherit; cursor: pointer; border: none; background: none; }
+    input { font-family: inherit; }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:none; } }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fillBar { from { width: 0; } }
+    .fu { animation: fadeUp 0.45s cubic-bezier(0.22,1,0.36,1) both; }
+    .fu2 { animation: fadeUp 0.45s cubic-bezier(0.22,1,0.36,1) 0.1s both; }
+    .fu3 { animation: fadeUp 0.45s cubic-bezier(0.22,1,0.36,1) 0.2s both; }
+    button:disabled { cursor: not-allowed; }
+  `}</style>
+);
+
+/* ─────────────────────────────────────────────
+   UPLOAD SCREEN
+───────────────────────────────────────────── */
+function UploadScreen({ onParsed }) {
+  const [dragging, setDragging] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const fileRef = useRef();
+
+  const process = async (file) => {
+    if (!file || !file.name.endsWith(".pdf")) { setError("Please provide a PDF file."); return; }
+    setLoading(true); setError("");
+    try {
+      const text = await extractText(file);
+      const questions = parseQuestions(text);
+      if (questions.length === 0) {
+        setError('No questions found. Ensure your PDF uses numbered questions:\n"1. Question  A) Option  B) Option  Ans: A"');
+      } else {
+        onParsed(questions, file.name);
+      }
+    } catch (e) { setError("Could not read PDF: " + e.message); }
+    setLoading(false);
+  };
+
+  return (
+    <div style={s.page}>
+      <div style={s.uploadWrap} className="fu">
+        <div style={s.uploadHeader}>
+          <div style={s.logoMark}>E</div>
+          <div>
+            <h1 style={s.brand}>Examiner</h1>
+            <p style={s.brandSub}>Professional Test Platform</p>
+          </div>
+        </div>
+        <div style={s.divider} />
+        <h2 style={s.sectionTitle}>Upload Your Question Paper</h2>
+        <p style={s.desc}>Upload a PDF with numbered questions and multiple choice options. Answer keys are optional — if present, they enable automatic scoring.</p>
+        <div
+          style={{ ...s.dropzone, ...(dragging ? s.dropzoneDragging : {}) }}
+          onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => { e.preventDefault(); setDragging(false); process(e.dataTransfer.files[0]); }}
+          onClick={() => !loading && fileRef.current.click()}
+        >
+          <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={(e) => process(e.target.files[0])} />
+          {loading ? (
+            <div style={{ textAlign: "center" }}>
+              <div style={s.spinner}>◌</div>
+              <p style={{ color: C.inkLight, marginTop: 12, fontSize: 15 }}>Reading PDF…</p>
+            </div>
+          ) : (
+            <>
+              <div style={s.dropIconBig}>📋</div>
+              <p style={s.dropMain}>Drag & drop PDF here</p>
+              <p style={s.dropOr}>— or —</p>
+              <span style={s.browseBtn}>Browse Files</span>
+            </>
+          )}
+        </div>
+        {error && <div style={s.errorBox}><span style={{ fontSize: 18 }}>⚠</span><pre style={s.errorText}>{error}</pre></div>}
+        <div style={s.hintBox}>
+          <p style={s.hintTitle}>Expected PDF format</p>
+          <code style={s.hintCode}>{`1. Which gas do plants absorb?\n   A) Oxygen  B) Nitrogen  C) Carbon Dioxide  D) Hydrogen\n   Ans: C`}</code>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   CONFIG SCREEN
+───────────────────────────────────────────── */
+function ConfigScreen({ questions, fileName, onStart }) {
+  const [cfg, setCfg] = useState({ duration: 60, marks: 4, negative: 1, count: questions.length });
+  const upd = (k) => (e) => setCfg((c) => ({ ...c, [k]: parseFloat(e.target.value) || 0 }));
+  const maxScore = cfg.count * cfg.marks;
+
+  return (
+    <div style={s.page}>
+      <div style={s.configWrap} className="fu">
+        <div style={{ marginBottom: 28 }}>
+          <div style={s.successPill}>✓ {questions.length} questions detected</div>
+          <p style={{ color: C.inkLight, fontSize: 13, marginTop: 6 }}>{fileName}</p>
+        </div>
+        <h2 style={s.sectionTitle}>Configure Test Settings</h2>
+        <div style={s.fieldGrid}>
+          <Field label="Test Duration" unit="minutes" value={cfg.duration} min={1} step={1} onChange={upd("duration")} />
+          <Field label="Marks per Correct" unit="marks" value={cfg.marks} min={0.25} step={0.25} onChange={upd("marks")} />
+          <Field label="Negative Marking" unit="per wrong" value={cfg.negative} min={0} step={0.25} onChange={upd("negative")} />
+          <Field label="Questions to Attempt" unit={`of ${questions.length}`} value={cfg.count} min={1} max={questions.length} step={1} onChange={upd("count")} />
+        </div>
+        <div style={s.scoreSummary}>
+          <SumItem label="Max Score" value={maxScore.toFixed(2)} color={C.green} />
+          <SumItem label="Negative / Wrong" value={`−${cfg.negative}`} color={C.accent} />
+          <SumItem label="Duration" value={`${cfg.duration} min`} color={C.gold} />
+        </div>
+        <button style={s.startBtn} onClick={() => onStart(questions.slice(0, cfg.count), cfg)}>Begin Test →</button>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, unit, value, min, max, step, onChange }) {
+  return (
+    <label style={s.fieldWrap}>
+      <span style={s.fieldLabel}>{label}</span>
+      <div style={s.fieldRow}>
+        <input style={s.fieldInput} type="number" value={value} min={min} max={max} step={step} onChange={onChange} />
+        <span style={s.fieldUnit}>{unit}</span>
+      </div>
+    </label>
+  );
+}
+
+function SumItem({ label, value, color }) {
+  return (
+    <div style={s.sumItem}>
+      <span style={s.sumLabel}>{label}</span>
+      <span style={{ ...s.sumValue, color }}>{value}</span>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   TIMER
+───────────────────────────────────────────── */
+function TimerBlock({ totalSeconds, onExpire }) {
+  const [remaining, setRemaining] = useState(totalSeconds);
+  useEffect(() => {
+    const id = setInterval(() => setRemaining((r) => {
+      if (r <= 1) { clearInterval(id); onExpire(); return 0; }
+      return r - 1;
+    }), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const pct = (remaining / totalSeconds) * 100;
+  const urgent = remaining < 300;
+  const h = Math.floor(remaining / 3600);
+  const m = Math.floor((remaining % 3600) / 60);
+  const sec = remaining % 60;
+  const fmt = (n) => String(n).padStart(2, "0");
+  return (
+    <div style={{ ...s.timerBlock, ...(urgent ? s.timerUrgent : {}) }}>
+      <span style={s.timerLabel}>TIME LEFT</span>
+      <span style={{ ...s.timerDigits, color: urgent ? C.accent : C.ink }}>
+        {h > 0 && `${fmt(h)}:`}{fmt(m)}:{fmt(sec)}
+      </span>
+      <div style={s.timerTrack}>
+        <div style={{ ...s.timerFill, width: `${pct}%`, background: urgent ? C.accent : C.green }} />
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   QUIZ SCREEN
+───────────────────────────────────────────── */
+function QuizScreen({ questions, cfg, onFinish }) {
+  const [idx, setIdx] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [chosen, setChosen] = useState(null);
+  const [confirm, setConfirm] = useState(false);
+
+  const q = questions[idx];
+  const total = questions.length;
+  const answeredCount = Object.keys(answers).length;
+
+  useEffect(() => { setChosen(answers[q.id] ?? null); }, [idx]);
+
+  const commitCurrent = (prev) => {
+    const next = { ...prev };
+    if (chosen !== null) next[q.id] = chosen;
+    return next;
+  };
+
+  const goTo = (newIdx) => {
+    setAnswers((prev) => commitCurrent(prev));
+    setIdx(newIdx);
+  };
+
+  const doFinish = () => {
+    const final = commitCurrent({ ...answers });
+    onFinish(final);
+  };
+
+  const statusOf = (i) => {
+    if (i === idx) return "current";
+    if (answers[questions[i].id] !== undefined) return "answered";
+    return "none";
+  };
+
+  return (
+    <div style={s.quizRoot}>
+      {/* TOP BAR */}
+      <header style={s.topBar}>
+        <div style={s.topLeft}>
+          <span style={s.topBrand}>Examiner</span>
+          <span style={s.topMeta}>{idx + 1} / {total} questions</span>
+        </div>
+        <TimerBlock totalSeconds={cfg.duration * 60} onExpire={doFinish} />
+        <button style={s.endBtn} onClick={() => setConfirm(true)}>Submit Test</button>
+      </header>
+
+      <div style={s.quizLayout}>
+        {/* MAIN QUESTION */}
+        <main style={s.questionArea} key={idx} className="fu">
+          <div style={s.qMeta}>
+            <span style={s.qBadge}>Question {q.id}</span>
+            {answers[q.id] && <span style={s.savedTag}>● Saved</span>}
+          </div>
+          <p style={s.qText}>{q.text}</p>
+          <div style={s.optionsList}>
+            {q.options.map((opt) => (
+              <button
+                key={opt.letter}
+                style={{ ...s.optBtn, ...(chosen === opt.letter ? s.optChosen : {}) }}
+                onClick={() => setChosen(opt.letter)}
+              >
+                <span style={{ ...s.optBubble, ...(chosen === opt.letter ? s.optBubbleChosen : {}) }}>
+                  {opt.letter}
+                </span>
+                <span style={s.optText}>{opt.text}</span>
+              </button>
+            ))}
+          </div>
+          <div style={s.navRow}>
+            <button style={s.skipBtn} onClick={() => { if (idx < total - 1) { setIdx(idx + 1); setChosen(null); } }} disabled={idx === total - 1}>
+              Skip →
+            </button>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button style={{ ...s.prevBtn, opacity: idx === 0 ? 0.4 : 1 }} onClick={() => goTo(idx - 1)} disabled={idx === 0}>← Prev</button>
+              {idx < total - 1
+                ? <button style={{ ...s.nextBtn, opacity: chosen === null ? 0.5 : 1 }} onClick={() => { setAnswers((p) => commitCurrent(p)); setIdx(idx + 1); setChosen(null); }}>Save & Next →</button>
+                : <button style={s.finishBtn} onClick={() => setConfirm(true)}>Finish Test ✓</button>
+              }
+            </div>
+          </div>
+        </main>
+
+        {/* SIDEBAR */}
+        <aside style={s.sidebar}>
+          <div style={s.sideStats}>
+            <div style={s.sideStatItem}>
+              <span style={{ color: C.green, fontSize: 20, fontWeight: 700 }}>{answeredCount}</span>
+              <span style={s.sideStatLabel}>Answered</span>
+            </div>
+            <div style={s.sideStatDivider} />
+            <div style={s.sideStatItem}>
+              <span style={{ color: C.accent, fontSize: 20, fontWeight: 700 }}>{total - answeredCount}</span>
+              <span style={s.sideStatLabel}>Remaining</span>
+            </div>
+          </div>
+          <p style={s.paletteTitle}>Question Palette</p>
+          <div style={s.palette}>
+            {questions.map((_, i) => {
+              const st = statusOf(i);
+              return (
+                <button key={i} style={{ ...s.palBtn, ...(st === "current" ? s.palCurrent : st === "answered" ? s.palAnswered : {}) }} onClick={() => goTo(i)}>
+                  {questions[i].id}
+                </button>
+              );
+            })}
+          </div>
+          <div style={s.legend}>
+            <LegendDot color={C.green} label="Answered" />
+            <LegendDot color={C.accent} label="Current" />
+            <LegendDot color={C.border} label="Unanswered" />
+          </div>
+        </aside>
+      </div>
+
+      {/* CONFIRM MODAL */}
+      {confirm && (
+        <div style={s.overlay}>
+          <div style={s.modal} className="fu">
+            <h3 style={s.modalTitle}>Submit Test?</h3>
+            <p style={s.modalBody}>
+              You've answered <strong>{Object.keys(commitCurrent({ ...answers })).length}</strong> of <strong>{total}</strong> questions.
+              {total - Object.keys(commitCurrent({ ...answers })).length > 0 && ` ${total - Object.keys(commitCurrent({ ...answers })).length} will be marked skipped.`}
+            </p>
+            <div style={s.modalBtns}>
+              <button style={s.cancelBtn} onClick={() => setConfirm(false)}>Continue Test</button>
+              <button style={s.confirmBtn} onClick={doFinish}>Yes, Submit</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LegendDot({ color, label }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.inkLight }}>
+      <div style={{ width: 10, height: 10, borderRadius: 3, background: color }} />
+      {label}
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   RESULTS SCREEN
+───────────────────────────────────────────── */
+function ResultsScreen({ questions, answers, cfg, onRetake }) {
+  const noKey = questions.every((q) => !q.correct);
+  let correct = 0, wrong = 0, skipped = 0;
+  questions.forEach((q) => {
+    if (!answers[q.id]) { skipped++; return; }
+    if (noKey || answers[q.id] === q.correct) correct++;
+    else wrong++;
+  });
+  const score = correct * cfg.marks - wrong * cfg.negative;
+  const maxScore = questions.length * cfg.marks;
+  const pct = maxScore > 0 ? Math.max(0, (score / maxScore) * 100) : 0;
+  const [label, col] = pct >= 90 ? ["Outstanding", C.green] : pct >= 75 ? ["Good", C.gold] : pct >= 50 ? ["Average", C.inkLight] : ["Needs Work", C.accent];
+
+  return (
+    <div style={s.page}>
+      <div style={s.resultsWrap}>
+        <div style={s.scoreHero} className="fu">
+          <p style={s.resultsSub}>Test Complete</p>
+          <h1 style={s.scoreNum}>{Math.max(0, score).toFixed(2)}</h1>
+          <p style={s.scoreOf}>out of {maxScore.toFixed(2)} marks</p>
+          <div style={{ ...s.gradePill, background: col + "20", color: col }}>{label}</div>
+          <div style={s.resultBar}><div style={{ ...s.resultBarFill, width: `${Math.min(100, pct)}%` }} /></div>
+          <p style={{ color: C.inkLight, fontSize: 14, marginTop: 8 }}>{pct.toFixed(1)}% scored</p>
+        </div>
+
+        <div style={s.statsGrid} className="fu2">
+          {[["✓", correct, "Correct", C.green], ["✗", wrong, "Wrong", C.accent], ["—", skipped, "Skipped", C.inkLight], ["◎", correct + wrong, "Attempted", C.gold]].map(([ic, val, lab, c]) => (
+            <div key={lab} style={s.statCard}>
+              <span style={{ color: c, fontSize: 20, fontWeight: 700 }}>{ic}</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 24, fontWeight: 700, color: c }}>{val}</span>
+              <span style={{ fontSize: 12, color: C.inkLight }}>{lab}</span>
+            </div>
+          ))}
+        </div>
+
+        {!noKey && (
+          <div style={s.breakdown} className="fu3">
+            <p style={s.bkTitle}>Score Calculation</p>
+            <div style={s.bkRow}><span>Correct: {correct} × {cfg.marks}</span><span style={{ color: C.green }}>+{(correct * cfg.marks).toFixed(2)}</span></div>
+            <div style={s.bkRow}><span>Wrong: {wrong} × {cfg.negative}</span><span style={{ color: C.accent }}>−{(wrong * cfg.negative).toFixed(2)}</span></div>
+            <div style={{ ...s.bkRow, borderTop: `1px solid ${C.border}`, paddingTop: 10, marginTop: 4, fontWeight: 700 }}><span>Net Score</span><span style={{ color: score >= 0 ? C.green : C.accent }}>{score.toFixed(2)}</span></div>
+          </div>
+        )}
+
+        {noKey && <p style={{ textAlign: "center", color: C.inkLight, fontSize: 13 }}>No answer key in PDF — all attempted questions counted as correct.</p>}
+
+        <button style={s.retakeBtn} onClick={onRetake}>↺ Take Another Test</button>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   ROOT
+───────────────────────────────────────────── */
+export default function App() {
+  const [screen, setScreen] = useState("upload");
+  const [questions, setQuestions] = useState([]);
+  const [fileName, setFileName] = useState("");
+  const [cfg, setCfg] = useState({});
+  const [answers, setAnswers] = useState({});
+
+  return (
+    <>
+      <GlobalCSS />
+      {screen === "upload" && <UploadScreen onParsed={(qs, fn) => { setQuestions(qs); setFileName(fn); setScreen("config"); }} />}
+      {screen === "config" && <ConfigScreen questions={questions} fileName={fileName} onStart={(qs, c) => { setQuestions(qs); setCfg(c); setScreen("quiz"); }} />}
+      {screen === "quiz" && <QuizScreen questions={questions} cfg={cfg} onFinish={(ans) => { setAnswers(ans); setScreen("results"); }} />}
+      {screen === "results" && <ResultsScreen questions={questions} answers={answers} cfg={cfg} onRetake={() => setScreen("upload")} />}
+    </>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   STYLES
+───────────────────────────────────────────── */
+const s = {
+  page: { minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: "32px 16px" },
+
+  uploadWrap: { background: C.paper, border: `1px solid ${C.border}`, borderRadius: 20, padding: "44px 48px", maxWidth: 580, width: "100%", boxShadow: `0 4px 32px ${C.shadow}` },
+  uploadHeader: { display: "flex", alignItems: "center", gap: 16, marginBottom: 28 },
+  logoMark: { width: 48, height: 48, borderRadius: 12, background: C.accent, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, fontFamily: "'Playfair Display', Georgia, serif", fontWeight: 900, flexShrink: 0 },
+  brand: { fontFamily: "'Playfair Display', Georgia, serif", fontSize: 24, fontWeight: 700, color: C.ink, lineHeight: 1.1 },
+  brandSub: { fontSize: 13, color: C.inkLight, marginTop: 2 },
+  divider: { height: 1, background: C.border, margin: "0 0 28px" },
+  sectionTitle: { fontFamily: "'Playfair Display', Georgia, serif", fontSize: 22, fontWeight: 700, marginBottom: 10 },
+  desc: { color: C.inkLight, fontSize: 15, lineHeight: 1.6, marginBottom: 28 },
+
+  dropzone: { border: `2px dashed ${C.borderStrong}`, borderRadius: 16, padding: "44px 24px", textAlign: "center", cursor: "pointer", background: C.bg, transition: "border-color 0.2s, background 0.2s", marginBottom: 20 },
+  dropzoneDragging: { borderColor: C.accent, background: C.accentBg },
+  dropIconBig: { fontSize: 52, marginBottom: 12 },
+  dropMain: { fontSize: 17, fontWeight: 600, color: C.ink, marginBottom: 8 },
+  dropOr: { color: C.inkLight, fontSize: 13, marginBottom: 12 },
+  browseBtn: { display: "inline-block", padding: "9px 22px", background: C.accent, color: "#fff", borderRadius: 8, fontSize: 14, fontWeight: 600, letterSpacing: 0.3 },
+  spinner: { fontSize: 36, color: C.accent, display: "inline-block", animation: "spin 1s linear infinite" },
+
+  errorBox: { display: "flex", gap: 10, alignItems: "flex-start", background: C.accentBg, border: `1px solid ${C.accent}40`, borderRadius: 10, padding: "14px 16px", marginBottom: 16 },
+  errorText: { fontSize: 13, color: C.accent, fontFamily: "'JetBrains Mono', monospace", whiteSpace: "pre-wrap", lineHeight: 1.6 },
+  hintBox: { background: C.bg, border: `1px solid ${C.border}`, borderRadius: 12, padding: "16px 20px" },
+  hintTitle: { fontSize: 11, fontWeight: 700, color: C.inkLight, textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 },
+  hintCode: { fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: C.inkLight, whiteSpace: "pre", display: "block", lineHeight: 1.7 },
+
+  configWrap: { background: C.paper, border: `1px solid ${C.border}`, borderRadius: 20, padding: "44px 48px", maxWidth: 560, width: "100%", boxShadow: `0 4px 32px ${C.shadow}` },
+  successPill: { display: "inline-flex", alignItems: "center", gap: 6, background: C.greenBg, color: C.green, borderRadius: 100, padding: "5px 14px", fontSize: 13, fontWeight: 600 },
+
+  fieldGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 },
+  fieldWrap: { display: "flex", flexDirection: "column", gap: 6 },
+  fieldLabel: { fontSize: 11, fontWeight: 700, color: C.inkLight, textTransform: "uppercase", letterSpacing: 0.8 },
+  fieldRow: { display: "flex", alignItems: "center", border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", background: C.bg },
+  fieldInput: { flex: 1, border: "none", background: "transparent", padding: "10px 14px", fontSize: 18, color: C.ink, outline: "none", fontFamily: "'JetBrains Mono', monospace" },
+  fieldUnit: { padding: "0 12px", fontSize: 11, color: C.inkLight, borderLeft: `1px solid ${C.border}`, whiteSpace: "nowrap" },
+
+  scoreSummary: { display: "flex", justifyContent: "space-between", background: C.bg, border: `1px solid ${C.border}`, borderRadius: 12, padding: "16px 20px", marginBottom: 28 },
+  sumItem: { display: "flex", flexDirection: "column", gap: 3, alignItems: "center" },
+  sumLabel: { fontSize: 11, color: C.inkLight, textTransform: "uppercase", letterSpacing: 0.6 },
+  sumValue: { fontSize: 20, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 },
+
+  startBtn: { width: "100%", padding: 15, background: C.accent, color: "#fff", borderRadius: 12, fontSize: 16, fontWeight: 700, letterSpacing: 0.3, boxShadow: `0 4px 20px ${C.accent}44` },
+
+  quizRoot: { minHeight: "100vh", background: C.bg, display: "flex", flexDirection: "column" },
+  topBar: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 28px", background: C.paper, borderBottom: `1px solid ${C.border}`, boxShadow: `0 2px 12px ${C.shadow}`, flexWrap: "wrap", gap: 12, position: "sticky", top: 0, zIndex: 10 },
+  topLeft: { display: "flex", alignItems: "center", gap: 14 },
+  topBrand: { fontFamily: "'Playfair Display', Georgia, serif", fontSize: 20, fontWeight: 700 },
+  topMeta: { color: C.inkLight, fontSize: 13, fontFamily: "'JetBrains Mono', monospace" },
+
+  timerBlock: { display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 20px", background: C.bg, borderRadius: 10, border: `1px solid ${C.border}`, minWidth: 150 },
+  timerUrgent: { background: C.accentBg, border: `1px solid ${C.accent}`, animation: "pulse 1s ease infinite" },
+  timerLabel: { fontSize: 10, color: C.inkLight, textTransform: "uppercase", letterSpacing: 1.2 },
+  timerDigits: { fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700 },
+  timerTrack: { width: "100%", height: 3, background: C.border, borderRadius: 4, overflow: "hidden" },
+  timerFill: { height: "100%", borderRadius: 4, transition: "width 1s linear" },
+
+  endBtn: { padding: "9px 20px", background: "transparent", border: `1px solid ${C.accent}`, borderRadius: 8, color: C.accent, fontSize: 14, fontWeight: 600 },
+
+  quizLayout: { display: "flex", flex: 1 },
+  questionArea: { flex: 1, padding: "36px 44px", overflowY: "auto" },
+  qMeta: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20 },
+  qBadge: { fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 700, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: "4px 12px", color: C.inkLight, textTransform: "uppercase", letterSpacing: 1 },
+  savedTag: { fontSize: 12, fontWeight: 700, color: C.green },
+  qText: { fontSize: 20, lineHeight: 1.7, color: C.ink, marginBottom: 28 },
+
+  optionsList: { display: "flex", flexDirection: "column", gap: 10, marginBottom: 36 },
+  optBtn: { display: "flex", alignItems: "flex-start", gap: 14, padding: "16px 20px", background: C.paper, border: `1.5px solid ${C.border}`, borderRadius: 12, textAlign: "left", width: "100%", transition: "all 0.15s" },
+  optChosen: { borderColor: C.accent, background: C.accentBg },
+  optBubble: { width: 30, height: 30, borderRadius: 8, border: `1.5px solid ${C.borderStrong}`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: C.inkLight, flexShrink: 0, background: C.bg },
+  optBubbleChosen: { background: C.accent, borderColor: C.accent, color: "#fff" },
+  optText: { fontSize: 16, lineHeight: 1.55, color: C.ink, paddingTop: 4 },
+
+  navRow: { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  skipBtn: { color: C.inkLight, fontSize: 14, fontWeight: 500, textDecoration: "underline", background: "none", border: "none" },
+  prevBtn: { padding: "10px 20px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, color: C.inkLight, fontSize: 14, fontWeight: 500 },
+  nextBtn: { padding: "10px 24px", background: C.accent, borderRadius: 8, color: "#fff", fontSize: 14, fontWeight: 700, boxShadow: `0 3px 12px ${C.accent}44`, transition: "opacity 0.15s" },
+  finishBtn: { padding: "10px 24px", background: C.green, borderRadius: 8, color: "#fff", fontSize: 14, fontWeight: 700, boxShadow: `0 3px 12px ${C.green}44` },
+
+  sidebar: { width: 220, background: C.paper, borderLeft: `1px solid ${C.border}`, padding: "24px 16px", overflowY: "auto", flexShrink: 0 },
+  sideStats: { display: "flex", alignItems: "center", justifyContent: "center", gap: 16, marginBottom: 24, paddingBottom: 20, borderBottom: `1px solid ${C.border}` },
+  sideStatItem: { display: "flex", flexDirection: "column", alignItems: "center", gap: 3 },
+  sideStatLabel: { fontSize: 11, color: C.inkLight, textTransform: "uppercase", letterSpacing: 0.6 },
+  sideStatDivider: { width: 1, height: 32, background: C.border },
+  paletteTitle: { fontSize: 11, color: C.inkLight, textTransform: "uppercase", letterSpacing: 0.8, fontWeight: 700, marginBottom: 12 },
+  palette: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 5, marginBottom: 20 },
+  palBtn: { padding: "7px 0", borderRadius: 7, border: `1.5px solid ${C.border}`, background: C.bg, color: C.inkLight, fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, transition: "all 0.12s" },
+  palCurrent: { background: C.accent, color: "#fff", borderColor: C.accent },
+  palAnswered: { background: C.green, color: "#fff", borderColor: C.green },
+  legend: { display: "flex", flexDirection: "column", gap: 6 },
+
+  overlay: { position: "fixed", inset: 0, background: "rgba(26,22,18,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 99 },
+  modal: { background: C.paper, border: `1px solid ${C.border}`, borderRadius: 18, padding: "40px 44px", maxWidth: 400, width: "90%", boxShadow: `0 16px 60px ${C.shadowMd}` },
+  modalTitle: { fontFamily: "'Playfair Display', Georgia, serif", fontSize: 22, fontWeight: 700, marginBottom: 12 },
+  modalBody: { color: C.inkLight, fontSize: 15, lineHeight: 1.6, marginBottom: 28 },
+  modalBtns: { display: "flex", gap: 10 },
+  cancelBtn: { flex: 1, padding: 12, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 9, color: C.ink, fontSize: 14, fontWeight: 500 },
+  confirmBtn: { flex: 1, padding: 12, background: C.accent, borderRadius: 9, color: "#fff", fontSize: 14, fontWeight: 700 },
+
+  resultsWrap: { background: C.paper, border: `1px solid ${C.border}`, borderRadius: 24, padding: "52px 48px", maxWidth: 520, width: "100%", boxShadow: `0 4px 40px ${C.shadow}`, display: "flex", flexDirection: "column", alignItems: "center", gap: 32 },
+  scoreHero: { textAlign: "center", width: "100%" },
+  resultsSub: { fontSize: 12, color: C.inkLight, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 700, marginBottom: 10 },
+  scoreNum: { fontFamily: "'Playfair Display', Georgia, serif", fontSize: 72, fontWeight: 900, color: C.ink, lineHeight: 1 },
+  scoreOf: { color: C.inkLight, fontSize: 16, margin: "8px 0 14px" },
+  gradePill: { display: "inline-block", padding: "6px 18px", borderRadius: 100, fontWeight: 700, fontSize: 15, letterSpacing: 0.3, marginBottom: 18 },
+  resultBar: { height: 10, background: C.border, borderRadius: 10, overflow: "hidden", maxWidth: 320, margin: "0 auto" },
+  resultBarFill: { height: "100%", background: C.green, borderRadius: 10, animation: "fillBar 1.2s ease" },
+
+  statsGrid: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, width: "100%" },
+  statCard: { display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "16px 8px", background: C.bg, border: `1px solid ${C.border}`, borderRadius: 12 },
+
+  breakdown: { width: "100%", background: C.bg, border: `1px solid ${C.border}`, borderRadius: 14, padding: "20px 24px" },
+  bkTitle: { fontSize: 11, fontWeight: 700, color: C.inkLight, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 14 },
+  bkRow: { display: "flex", justifyContent: "space-between", fontSize: 14, color: C.inkLight, padding: "5px 0", fontFamily: "'JetBrains Mono', monospace" },
+
+  retakeBtn: { padding: "14px 40px", background: C.accent, color: "#fff", borderRadius: 12, fontSize: 16, fontWeight: 700, boxShadow: `0 4px 20px ${C.accent}44` },
+};
